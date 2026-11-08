@@ -1,1 +1,4 @@
 turnip_workdir
+
+# Windows "Mark of the Web" metadata that sneaks in when files are copied/downloaded on Windows
+*:Zone.Identifier

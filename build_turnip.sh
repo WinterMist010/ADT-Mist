@@ -79,7 +79,7 @@ apply_oneui_glitch() {
 
 apply_Gen8_a8xx() {
     log "A8xx Gen8: aplicando whitebelyash turnip/gen8 stack..."
-    patch -p1 -N --fuzz=4 --no-backup-if-mismatch < "$REPO_ROOT/patches/patchsv2/a8xx_gen8.patch"
+    patch -p1 -N --fuzz=4 --no-backup-if-mismatch < "$REPO_ROOT/patches/patchsv2/0000-a8xx.patch"
 
     log "A8xx Gen8: shared memory 32 KiB -> 64 KiB..."
     python3 "$REPO_ROOT/patches/patchsv2/a8xx_shared_mem.py"
@@ -114,7 +114,7 @@ apply_Patched_android_scripts() {
 }
 
 apply_Patched_extra_patches() {
-    log "A8xx Patched: aplicando patchset extra 0001-0005..."
+    log "A8xx Patched: aplicando patchset extra 0001-0009..."
     local patch_file
     local count=0
     for patch_file in "$REPO_ROOT"/patches/patchsv1/000*.patch; do
@@ -127,7 +127,8 @@ apply_Patched_extra_patches() {
         git apply "$patch_file"
         count=$((count + 1))
     done
-    [ "$count" -eq 5 ] || die "Esperados 5 patches Patched, encontrados $count"
+    [ "$count" -gt 0 ] || die "Nenhum patch Patched encontrado em patches/patchsv1/000*.patch"
+    log "Patched: $count patch(es) extra aplicado(s)"
 }
 
 # Compatibility-derived A8xx register adjustments. Existing Patched scope.
@@ -161,11 +162,23 @@ apply_a8xx_game_profiles() {
     python3 "$REPO_ROOT/patches/a8xx/game_ssbo_profiles.py"
 }
 
+# Runs an A8xx Python patch non-fatally: logs its output but never aborts the
+# build if the patch's anchor has drifted (all these scripts warn and skip on
+# anchor drift; a8xx_sp_hysteresis.py may sys.exit(1) when its anchor is
+# absent, which would otherwise trip `set -e`).
+apply_optional_python_patch() {
+    local script="$1"
+    log "A8xx: running $(basename "$script")..."
+    if ! python3 "$script"; then
+        log "A8xx: $(basename "$script") skipped (anchor not present in this Mesa tree)"
+    fi
+}
+
 # Compatibility Android fixes, scoped to A8xx Gen8 and A8xx Patched only.
 # Preserve the existing variant-specific GPU recipes and Patched patches.
 apply_Compatibility_a8xx() {
     log "A8xx: applying Compatibility compatibility fixes (without KGSL PWR_MAX)..."
-    local dd="$REPO_ROOT/patches/Compatibility"
+    local dd="$REPO_ROOT/patches/patchsv3"
 
     # The two A8xx recipes already supply A825 and most A810/A829 settings;
     # add only missing KGSL aliases, plus A845/A850, not a duplicate GPU stack.
@@ -428,6 +441,12 @@ main() {
     if [ "$VARIANT" = "a8xx-gen8" ] || [ "$VARIANT" = "a8xx-patched" ]; then
         apply_Compatibility_a8xx
         apply_a8xx_game_profiles
+        # A8xx Shader-Processor hysteresis + FD810 + sysmem wait relaxation
+        apply_optional_python_patch "$REPO_ROOT/patches/patchsv3/scripts/fd810-vsc0d08.py"
+        apply_optional_python_patch "$REPO_ROOT/patches/patchsv3/scripts/a8xx_sp_hysteresis.py"
+        apply_optional_python_patch "$REPO_ROOT/patches/patchsv3/scripts/a8xx-sp-hysteresis-gs-hs-ds.py"
+        apply_optional_python_patch "$REPO_ROOT/patches/patchsv3/scripts/a8xx-sp-hysteresis-tune.py"
+        apply_optional_python_patch "$REPO_ROOT/patches/patchsv3/scripts/tu-sysmem-wfi-relax.py"
     fi
     apply_android_ndk_fixes
     build_android

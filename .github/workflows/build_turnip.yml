@@ -106,6 +106,7 @@ jobs:
           pip3 install --break-system-packages meson mako
 
       - name: Build ${{ matrix.artifact }}
+        id: build_step
         env:
           VARIANT: ${{ matrix.variant }}
           BUILD_VERSION: ${{ github.run_number }}
@@ -113,6 +114,22 @@ jobs:
         run: |
           chmod +x build_turnip.sh
           ./build_turnip.sh
+
+      - name: Record ${{ matrix.variant }} build status
+        if: always()
+        run: |
+          if [ "${{ steps.build_step.outcome }}" = "success" ]; then
+            echo "${{ matrix.variant }}=OK" > build-status.txt
+          else
+            echo "${{ matrix.variant }}=FAILED" > build-status.txt
+          fi
+
+      - name: Upload build status artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-status-${{ matrix.variant }}
+          path: build-status.txt
 
       - name: Verify ZIP
         run: |
@@ -135,21 +152,118 @@ jobs:
 
   release:
     needs: [resolve, prepare_release, build]
-    if: ${{ success() }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - name: Verify all four release assets
+      - name: Download build status artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: build-statuses
+
+      - name: Determine failed variants
+        id: failed
+        run: |
+          FAILED=""
+          for variant in a7xx a7xx-oneui a8xx-gen8 a8xx-patched; do
+            f="build-statuses/build-status-${variant}/build-status.txt"
+            if [ -f "$f" ]; then
+              status="$(cat "$f")"
+              echo "$variant: $status"
+              case "$status" in
+                *FAILED*) FAILED="$FAILED $variant" ;;
+              esac
+            else
+              echo "$variant: MISSING (no status file)"
+              FAILED="$FAILED $variant"
+            fi
+          done
+          echo "failed_variants=$FAILED" >> "$GITHUB_OUTPUT"
+
+      - name: Report release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
         run: |
           ASSET_COUNT="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')"
           echo "Release assets: $ASSET_COUNT"
-          test "$ASSET_COUNT" -eq 4
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | while read -r asset; do echo "  - $asset"; done
 
       - name: Publish Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
+          RELEASE_NAME: ${{ needs.resolve.outputs.release_name }}
+          MESA_COMMIT: ${{ needs.resolve.outputs.mesa_commit }}
+          FAILED_VARIANTS: ${{ steps.failed.outputs.failed_variants }}
         run: |
-          gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --repo "$GITHUB_REPOSITORY"
+          set -e
+
+          FAILED_VARIANTS="${FAILED_VARIANTS# }"
+
+          pretty() {
+            case "$1" in
+              a7xx) echo "A7xx" ;;
+              a7xx-oneui) echo "A7xx OneUI Glitch" ;;
+              a8xx-gen8) echo "A8xx Gen8" ;;
+              a8xx-patched) echo "A8xx Patched" ;;
+            esac
+          }
+
+          status_lines=""
+          failed_count=0
+          for variant in a7xx a7xx-oneui a8xx-gen8 a8xx-patched; do
+            name="$(pretty "$variant")"
+            case " $FAILED_VARIANTS " in
+              *" $variant "*)
+                status_lines="$status_lines
+          - ❌ $name — build FAILED"
+                failed_count=$((failed_count + 1))
+                ;;
+              *)
+                status_lines="$status_lines
+          - ✅ $name — built"
+                ;;
+            esac
+          done
+
+          release_name="$RELEASE_NAME"
+          notes_suffix=""
+          if [ -n "$FAILED_VARIANTS" ]; then
+            failed_names=""
+            for variant in $FAILED_VARIANTS; do
+              failed_names="$failed_names $(pretty "$variant")"
+            done
+            release_name="$release_name (⚠️ $failed_count build(s) failed:$failed_names)"
+            notes_suffix="
+            ## Build status
+            This release was published even though some builds failed:
+
+            $status_lines
+
+            Only variants marked ✅ have assets attached to this release. Failed variants were not built or uploaded."
+          else
+            notes_suffix="
+            ## Build status
+            All four variants built successfully."
+          fi
+
+          cat > release-notes.md <<EOF
+          Android/Bionic Turnip variants built from the same Mesa commit:
+          \`${MESA_COMMIT}\`
+
+          - A7xx
+          - A7xx OneUI Glitch
+          - A8xx Gen8
+          - A8xx Patched
+
+          Upstream KGSL sync and nonblocking timestamp polling verified.
+          A8xx: gralloc UBWC, IMapper5, memory budget, LRZ, SSBO and buffer descriptor fixes.
+          A8xx: subgroup correctness and game-specific SSBO compatibility.
+          All variants: static sample-shading interpolation gate.$notes_suffix
+          EOF
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --title "$release_name" --notes-file release-notes.md --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" --draft=false --prerelease=false --title "$release_name" --notes-file release-notes.md --target "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+          fi
